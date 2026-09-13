@@ -1,1 +1,332 @@
+/*
+   EDUVOS CAMPUS WALKTHROUGH
+   -------------------------------------------------------------------------
+   This is a working framework for a Street-View-style campus map:
+   - A network of "nodes" (locations on campus) laid out on a 2D map.
+   - Each node has a 360° equirectangular panorama.
+   - Walking = clicking directional arrows inside the panorama, or clicking
+     a different node on the mini map.
 
+   >>> HOW TO USE YOUR OWN 360 PHOTOS <<<
+   Right now, since no real Eduvos panoramas were supplied, every node's
+   pano is generated on the fly by generatePlaceholderPano() so the whole
+   thing runs and feels real immediately. To use real photography:
+     1. Shoot or export an equirectangular 360 photo per location
+        (2:1 aspect ratio, e.g. 4096x2048 .jpg) with a 360 camera or app
+        (Insta360, Ricoh Theta, Google Street View app, etc).
+     2. Host the images (e.g. /photos/entrance.jpg) and replace the
+        corresponding node's pano field below with that URL.
+     3. Delete or ignore generatePlaceholderPano() once every node has a
+        real photo.
+   The map layout (x/y), the node graph (links), and the viewer/hotspot
+   logic all work unchanged with real photos.
+   ========================
+*/
+
+// ---- 1. CAMPUS DATA -------------------------------------------------------
+// x,y are map-view coordinates on a 400x300 canvas (not GPS - swap for real
+// GPS-derived coordinates later if you want the mini map geographically
+// accurate).
+const nodes = [
+    { id: "entrance", name: "Main Entrance", x: 60, y: 230, links: ["quad"] },
+    { id: "quad", name: "Central Quad", x: 150, y: 190, links: ["entrance", "library", "cafeteria", "hallA"] },
+    { id: "library", name: "Library", x: 250, y: 150, links: ["quad", "hallB"] },
+    { id: "cafeteria", name: "Cafeteria", x: 150, y: 250, links: ["quad"] },
+    { id: "hallA", name: "Lecture Hall A", x: 100, y: 150, links: ["quad"] },
+    { id: "hallB", name: "Lecture Hall B", x: 300, y: 150, links: ["library"] },
+    { id: "parking", name: "Parking Lot", x: 350, y: 250, links: ["hallB"] },
+    { id: "lab", name: "Computer Lab", x: 200, y: 100, links: ["hallA", "library"] }
+];
+const nodeByID = Object.fromEntries(nodes.map(n => [n.id, n]));
+let currentID = "entrance";
+
+// ---- 2. PLACEHOLDER PANORAMA GENERATOR ------------------------------------
+// Produces a believable equirectangular "campus" scene per node so the demo
+// works without real photography. Swap this out for real photo URLs.
+function generatePlaceholderPano(node){
+    const w = 2048, h = 1024;
+    const c = document.createElement("canvas");
+    c.width = w; c.height = h;
+    const ctx = c.getContext("2d");
+
+    // Sky gradient
+    const sky = ctx.createLinearGradient(0, 0, 0, h/2);
+    sky.addColorStop(0, "#87CEEB"); // light blue
+    sky.addColorStop(1, "#FFFFFF"); // white
+    ctx.fillStyle = sky;
+    ctx.fillRect(0, 0, w, h/2);
+
+    // sun haze
+    ctx.fillStyle = "rgba(225,250,230,0.35)";
+    ctx.beginPath();
+    ctx.arc(w*0.78, h*0.22, 220, 0, Math.PI*2);
+    ctx.fill();
+
+    //ground
+    const ground = ctx.createLinearGradient(0,h*0.55,0,h);
+    ground.addColorStop(0, "#228B22"); // forest green
+    ground.addColorStop(1, "#006400"); // dark green
+    ctx.fillSTyle = ground;
+    ctx.fillReact(0,h*0.5,w,h*0.45);
+
+    // simple "building block" silhouettes around the horizon, seeded by node id
+    let seed = 0;
+    for (const ch of node.id) seed += ch.charCodeAt(0);
+    function rnd(n){ seed = (seed * 9301 + 49297) % 233280; return (seed/233280) * n; }
+
+    const buildingColors = ["#274b52", "#33636b", "1e3a40", "#3c5c46"];
+    let x = 0;
+    while (x < w){
+        const bw = 120 + rnd(160);
+        const bh = 60 + rnd(180);
+        ctx.fillStyle = buildingColors[Math.floor(rnd(buildingColors.length))];
+        ctx.fillRect(x, h*0.58 - bh, bw, bh);
+        //windows
+        ctx.fillStyle = "rgba(255,230,150,0.5)";
+        for (let wy = h*0.58 - bh + 10; wy < h*0.58 - 10; wy += 18){
+            for (let wx = x +8 ; wx < x + bw - 8; wx += 18){
+                if (rnd(10) > 6) ctx.fillRect(wx, wy, 8, 10);
+            }
+        }
+        x += bw + 20 + rnd(40);
+    }
+
+    // walking path
+    ctx.fillStyle ="rgba(210,200,170,0.9)";
+  ctx.beginPath();
+  ctx.moveTo(0, h*0.86);
+  ctx.quadraticCurveTo(w*0.5, h*0.78, w, h*0.88);
+  ctx.lineTo(w, h);
+  ctx.lineTo(0, h);
+  ctx.closePath();
+  ctx.fill();
+
+  // location label baked subtly into the ground (helps orient during demo)
+  ctx.font = "bold 46px 'Space Grotesk', sans-serif";
+  ctx.fillStyle = "rgba(20,30,25,0.35)";
+  ctx.textAlign = "center";
+  ctx.fillText(node.name.toUpperCase(), w/2, h*0.94);
+
+  return c.toDataURL("image/jpeg", 0.85);
+}
+
+// ---- 3. THREE.JS PANORAMA VIEWER ------------------------------------------
+const viewerEl = document.getElementById("viewer");
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(90, window.innerWidth/window.innerHeight, 1, 1100);
+const rendered = new THREE.WebGLRenderer({antialias:true});
+rendered.setSize(window.innerWidth, window.innerHeight);
+rendered.setPixelRatio(window.innerWidth, window.innerHeight);
+viewerEl.appendChild(rendered.domElement);
+
+const sphereGeo = new THREE.SphereGeometry(500, 60, 40);
+sphereGeo.scale(-1, 1, 1); // view form inside
+const sphereMat = new THREE.MeshBasicMaterial({ color: 0x222222 });
+const sphereMesh = new THREE.Mesh(sphereGeo, sphereMat);
+scene.add(sphereMesh);
+ 
+const textureLoader = new THREE.TextureLoader();
+const textureCache = {};
+ 
+function loadPanoTexture(node){
+  if (textureCache[node.id]) return Promise.resolve(textureCache[node.id]);
+  const url = node.pano || generatePlaceholderPano(node);
+  return new Promise((resolve) => {
+    textureLoader.load(url, (tex) => {
+      tex.colorSpace = THREE.SRGBColorSpace || tex.colorSpace;
+      textureCache[node.id] = tex;
+      resolve(tex);
+    });
+  });
+}
+ 
+// camera look direction (spherical)
+let lon = 180, lat = 0;
+let targetLon = lon, targetLat = lat;
+let fov = 90;
+ 
+function animate(){
+  requestAnimationFrame(animate);
+  lon += (targetLon - lon) * 0.12;
+  lat += (targetLat - lat) * 0.12;
+  lat = Math.max(-85, Math.min(85, lat));
+  const phi = THREE.MathUtils.degToRad(90 - lat);
+  const theta = THREE.MathUtils.degToRad(lon);
+  const target = new THREE.Vector3(
+    500 * Math.sin(phi) * Math.cos(theta),
+    500 * Math.cos(phi),
+    500 * Math.sin(phi) * Math.sin(theta)
+  );
+  camera.position.set(0,0,0);
+  camera.lookAt(target);
+  camera.fov = fov;
+  camera.updateProjectionMatrix();
+  renderer.render(scene, camera);
+  updateHotspotPositions();
+}
+animate();
+ 
+// ---- 4. DRAG-TO-LOOK CONTROLS ----------------------------------------------
+let isDragging = false, startX=0, startY=0, startLon=0, startLat=0;
+viewerEl.addEventListener("pointerdown", (e) => {
+  isDragging = true;
+  viewerEl.classList.add("dragging");
+  startX = e.clientX; startY = e.clientY;
+  startLon = targetLon; startLat = targetLat;
+});
+window.addEventListener("pointerup", () => { isDragging = false; viewerEl.classList.remove("dragging"); });
+window.addEventListener("pointermove", (e) => {
+  if (!isDragging) return;
+  const dx = e.clientX - startX;
+  const dy = e.clientY - startY;
+  targetLon = startLon - dx * 0.18;
+  targetLat = startLat + dy * 0.18;
+});
+// touch handled via pointer events already (pointer* fires for touch too)
+ 
+viewerEl.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  fov = Math.max(40, Math.min(100, fov + e.deltaY * 0.03));
+}, { passive:false });
+ 
+document.getElementById("zoomIn").onclick = () => fov = Math.max(40, fov - 10);
+document.getElementById("zoomOut").onclick = () => fov = Math.min(100, fov + 10);
+ 
+window.addEventListener("resize", () => {
+  camera.aspect = window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+ 
+// ---- 5. HOTSPOTS (walk to a connected location) ----------------------------
+const hotspotLayer = document.getElementById("app");
+let hotspotEls = [];
+ 
+function bearingBetween(a, b){
+  // angle (degrees) from node a to node b using the 2D map coordinates
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  return (THREE.MathUtils.radToDeg(Math.atan2(dy, dx)) + 360) % 360;
+}
+ 
+function buildHotspots(node){
+  hotspotEls.forEach(h => h.el.remove());
+  hotspotEls = [];
+  node.links.forEach(linkId => {
+    const target = nodeById[linkId];
+    if (!target) return;
+    const bearing = bearingBetween(node, target);
+    // convert map-bearing to panorama lon (0-360), matching viewer's theta convention
+    const lonDeg = (450 - bearing) % 360;
+ 
+    const el = document.createElement("div");
+    el.className = "hotspot";
+    el.innerHTML = `
+      <div class="arrow">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M12 4 L20 12 L12 20 M4 12 H20" stroke="white" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="tag">${target.name}</div>`;
+    el.addEventListener("click", () => goToNode(linkId));
+    hotspotLayer.appendChild(el);
+    hotspotEls.push({ el, lonDeg });
+  });
+}
+ 
+function updateHotspotPositions(){
+  hotspotEls.forEach(({el, lonDeg}) => {
+    const phi = THREE.MathUtils.degToRad(90); // horizon
+    const theta = THREE.MathUtils.degToRad(lonDeg);
+    const p = new THREE.Vector3(
+      480 * Math.sin(phi) * Math.cos(theta),
+      -20,
+      480 * Math.sin(phi) * Math.sin(theta)
+    );
+    const proj = p.clone().project(camera);
+    const behindCamera = proj.z > 1;
+    if (behindCamera){ el.style.display = "none"; return; }
+    el.style.display = "flex";
+    el.style.left = ((proj.x + 1) / 2 * window.innerWidth) + "px";
+    el.style.top = ((1 - proj.y) / 2 * window.innerHeight) + "px";
+  });
+}
+ 
+// ---- 6. MINI MAP (SVG) -----------------------------------------------------
+const svg = document.getElementById("campusMap");
+ 
+function drawMap(){
+  svg.innerHTML = "";
+  // paths
+  const drawn = new Set();
+  nodes.forEach(n => {
+    n.links.forEach(linkId => {
+      const key = [n.id, linkId].sort().join("-");
+      if (drawn.has(key)) return;
+      drawn.add(key);
+      const t = nodeById[linkId];
+      const line = document.createElementNS("http://www.w3.org/2000/svg","line");
+      line.setAttribute("x1", n.x); line.setAttribute("y1", n.y);
+      line.setAttribute("x2", t.x); line.setAttribute("y2", t.y);
+      line.setAttribute("class","map-path");
+      svg.appendChild(line);
+    });
+  });
+  // nodes
+  nodes.forEach(n => {
+    const g = document.createElementNS("http://www.w3.org/2000/svg","g");
+    g.setAttribute("class", "map-node" + (n.id === currentId ? " active" : ""));
+    g.style.cursor = "pointer";
+    g.addEventListener("click", () => goToNode(n.id));
+ 
+    if (n.id === currentId){
+      const pulse = document.createElementNS("http://www.w3.org/2000/svg","circle");
+      pulse.setAttribute("cx", n.x); pulse.setAttribute("cy", n.y);
+      pulse.setAttribute("r", 9); pulse.setAttribute("class","map-you");
+      svg.appendChild(pulse);
+    }
+ 
+    const c = document.createElementNS("http://www.w3.org/2000/svg","circle");
+    c.setAttribute("cx", n.x); c.setAttribute("cy", n.y);
+    c.setAttribute("r", n.id === currentId ? 9 : 6);
+    g.appendChild(c);
+ 
+    const t = document.createElementNS("http://www.w3.org/2000/svg","text");
+    t.setAttribute("x", n.x); t.setAttribute("y", n.y - 12);
+    t.setAttribute("text-anchor","middle");
+    t.textContent = n.name;
+    g.appendChild(t);
+ 
+    svg.appendChild(g);
+  });
+}
+ 
+document.getElementById("mapHeader").addEventListener("click", () => {
+  document.getElementById("mapPanel").classList.toggle("expanded");
+});
+ 
+// ---- 7. NAVIGATION ----------------------------------------------------------
+const fadeEl = document.getElementById("fade");
+const labelEl = document.getElementById("locationLabel");
+ 
+async function goToNode(id, silent){
+  const node = nodeById[id];
+  if (!node) return;
+  fadeEl.classList.add("show");
+  await new Promise(r => setTimeout(r, 260));
+ 
+  const tex = await loadPanoTexture(node);
+  sphereMesh.material.map = tex;
+  sphereMesh.material.color.set(0xffffff);
+  sphereMesh.material.needsUpdate = true;
+ 
+  currentId = id;
+  labelEl.textContent = node.name;
+  buildHotspots(node);
+  drawMap();
+ 
+  fadeEl.classList.remove("show");
+  document.getElementById("hint").style.opacity = "0";
+}
+ 
+// ---- 8. INIT ----------------------------------------------------------------
+goToNode(currentId);
+setTimeout(() => { document.getElementById("hint").style.opacity = "0"; }, 4500);
