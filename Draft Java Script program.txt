@@ -1,0 +1,539 @@
+/*
+   EDUVOS CAMPUS WALKTHROUGH
+   -------------------------------------------------------------------------
+   This is a working framework for a Street-View-style campus map:
+   - A network of "nodes" (locations on campus) laid out on a 2D map.
+   - Each node has a 360° equirectangular panorama.
+   - Walking = clicking directional arrows inside the panorama, or clicking
+     a different node on the mini map.
+
+   >>> HOW TO USE YOUR OWN 360 PHOTOS <<<
+   Right now, since no real Eduvos panoramas were supplied, every node's
+   pano is generated on the fly by generatePlaceholderPano() so the whole
+   thing runs and feels real immediately. To use real photography:
+     1. Shoot or export an equirectangular 360 photo per location
+        (2:1 aspect ratio, e.g. 4096x2048 .jpg) with a 360 camera or app
+        (Insta360, Ricoh Theta, Google Street View app, etc).
+     2. Host the images (e.g. /photos/entrance.jpg) and replace the
+        corresponding node's pano field below with that URL.
+     3. Delete or ignore generatePlaceholderPano() once every node has a
+        real photo.
+   The map layout (x/y), the node graph (links), and the viewer/hotspot
+   logic all work unchanged with real photos.
+   ========================
+*/
+
+// ---- 1. CAMPUS DATA -------------------------------------------------------
+// x,y are map-view coordinates on a 400x300 canvas (not GPS - swap for real
+// GPS-derived coordinates later if you want the mini map geographically
+// accurate).
+const nodes = [
+    { id: "entrance", name: "Main Entrance", x: 60, y: 230, links: ["quad"] },
+    { id: "quad", name: "Central Quad", x: 150, y: 190, links: ["entrance", "library", "cafeteria", "hallA"] },
+    { id: "library", name: "Library", x: 250, y: 150, links: ["quad", "hallB"] },
+    { id: "cafeteria", name: "Cafeteria", x: 150, y: 250, links: ["quad"] },
+    { id: "hallA", name: "Lecture Hall A", x: 100, y: 150, links: ["quad"] },
+    { id: "hallB", name: "Lecture Hall B", x: 300, y: 150, links: ["library"] },
+    { id: "parking", name: "Parking Lot", x: 350, y: 250, links: ["hallB"] },
+    { id: "lab", name: "Computer Lab", x: 200, y: 100, links: ["hallA", "library"] }
+];
+const nodeById = Object.fromEntries(nodes.map(n => [n.id, n]));
+let currentId = "entrance";
+
+const style = document.createElement("style");
+style.textContent = `
+  :root {
+    --bg-1: #071c2b;
+    --bg-2: #123f51;
+    --panel: rgba(9, 24, 31, 0.82);
+    --panel-border: rgba(125, 220, 205, 0.38);
+    --accent: #ffca5a;
+    --accent-2: #6de3d6;
+    --hotspot-bg: rgba(12, 27, 34, 0.8);
+    --map-path: rgba(128, 220, 208, 0.75);
+    --map-node: #f4efe7;
+    --map-node-active: #ffd76a;
+    --map-you: #7ef1a6;
+  }
+
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: radial-gradient(circle at top, #1d4d5b, var(--bg-1) 52%, #020c12 100%);
+    font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+    color: white;
+  }
+
+  body {
+    position: relative;
+  }
+
+  #viewer {
+    position: fixed;
+    inset: 0;
+    background: linear-gradient(180deg, #79c8dc 0%, #dfeef3 35%, #8ab29c 62%, #224f36 100%);
+  }
+
+  #app {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+  }
+
+  .hotspot {
+    position: absolute;
+    transform: translate(-50%, -50%);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--hotspot-bg);
+    border: 1px solid rgba(255,255,255,0.16);
+    border-radius: 999px;
+    padding: 10px 14px 10px 10px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+    cursor: pointer;
+    pointer-events: auto;
+  }
+
+  .hotspot .arrow {
+    display: grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent), #ff8c42);
+    box-shadow: inset 0 2px 8px rgba(255,255,255,0.4);
+  }
+
+  .hotspot .tag {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #edfdf8;
+    white-space: nowrap;
+  }
+
+  #mapPanel {
+    position: absolute;
+    right: 18px;
+    bottom: 18px;
+    width: min(320px, calc(100vw - 28px));
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 20px;
+    overflow: hidden;
+    backdrop-filter: blur(8px);
+    box-shadow: 0 18px 40px rgba(0, 0, 0, 0.28);
+  }
+
+  #mapHeader {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 14px;
+    background: rgba(255,255,255,0.04);
+    cursor: pointer;
+    color: #f2f8ff;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    font-size: 11px;
+  }
+
+  #campusMap {
+    width: 100%;
+    height: 180px;
+    display: block;
+    background: linear-gradient(180deg, rgba(12, 36, 45, 0.85), rgba(10, 24, 32, 0.95));
+  }
+
+  .map-path {
+    stroke: var(--map-path);
+    stroke-width: 2;
+    fill: none;
+    opacity: 0.95;
+  }
+
+  .map-node circle {
+    fill: var(--map-node);
+    stroke: rgba(10, 22, 26, 0.7);
+    stroke-width: 1.5;
+  }
+
+  .map-node.active circle {
+    fill: var(--map-node-active);
+    stroke: rgba(80, 52, 0, 0.9);
+  }
+
+  .map-you {
+    fill: var(--map-you);
+    filter: drop-shadow(0 0 10px rgba(126, 241, 166, 0.8));
+  }
+
+  .map-node text {
+    fill: rgba(236, 248, 255, 0.95);
+    font-size: 10px;
+    font-weight: 600;
+  }
+
+  #locationLabel {
+    position: absolute;
+    left: 24px;
+    bottom: 24px;
+    background: rgba(6, 18, 22, 0.68);
+    border: 1px solid rgba(145, 234, 220, 0.35);
+    border-radius: 999px;
+    color: #f3fffd;
+    padding: 10px 16px;
+    backdrop-filter: blur(6px);
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    box-shadow: 0 8px 18px rgba(0, 0, 0, 0.22);
+  }
+
+  #zoomControls {
+    position: absolute;
+    top: 20px;
+    right: 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    z-index: 5;
+  }
+
+  .zoom-btn {
+    width: 42px;
+    height: 42px;
+    border: 1px solid rgba(255,255,255,0.18);
+    border-radius: 50%;
+    background: rgba(10, 26, 32, 0.7);
+    color: white;
+    font-size: 24px;
+    font-weight: 700;
+    cursor: pointer;
+    box-shadow: 0 10px 20px rgba(0,0,0,0.2);
+  }
+
+  #fade {
+    position: fixed;
+    inset: 0;
+    background: rgba(7, 15, 18, 0.28);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.25s ease;
+  }
+
+  #fade.show {
+    opacity: 1;
+  }
+
+  #hint {
+    position: absolute;
+    left: 50%;
+    bottom: 110px;
+    transform: translateX(-50%);
+    background: rgba(22, 43, 53, 0.7);
+    border: 1px solid rgba(155, 230, 220, 0.4);
+    border-radius: 999px;
+    padding: 9px 14px;
+    color: #ebfffb;
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    opacity: 1;
+    transition: opacity 0.6s ease;
+  }
+`;
+document.head.appendChild(style);
+
+// ---- 2. PLACEHOLDER PANORAMA GENERATOR ------------------------------------
+// Produces a believable equirectangular "campus" scene per node so the demo
+// works without real photography. Swap this out for real photo URLs.
+function generatePlaceholderPano(node){
+    const w = 2048, h = 1024;
+    const c = document.createElement("canvas");
+    c.width = w; c.height = h;
+    const ctx = c.getContext("2d");
+
+    // Sky gradient
+    const sky = ctx.createLinearGradient(0, 0, 0, h/2);
+    sky.addColorStop(0, "#87CEEB"); // light blue
+    sky.addColorStop(1, "#FFFFFF"); // white
+    ctx.fillStyle = sky;
+    ctx.fillRect(0, 0, w, h/2);
+
+    // sun haze
+    ctx.fillStyle = "rgba(225,250,230,0.35)";
+    ctx.beginPath();
+    ctx.arc(w*0.78, h*0.22, 220, 0, Math.PI*2);
+    ctx.fill();
+
+    //ground
+    const ground = ctx.createLinearGradient(0,h*0.55,0,h);
+    ground.addColorStop(0, "#2e9f67");
+    ground.addColorStop(1, "#165b3d");
+    ctx.fillStyle = ground;
+    ctx.fillRect(0,h*0.5,w,h*0.45);
+
+    // simple "building block" silhouettes around the horizon, seeded by node id
+    let seed = 0;
+    for (const ch of node.id) seed += ch.charCodeAt(0);
+    function rnd(n){ seed = (seed * 9301 + 49297) % 233280; return (seed/233280) * n; }
+
+    const buildingColors = ["#1b3f5a", "#2a5268", "#3d6f60", "#e4b96d", "#3b4d6b"];
+    let x = 0;
+    while (x < w){
+        const bw = 120 + rnd(160);
+        const bh = 60 + rnd(180);
+        ctx.fillStyle = buildingColors[Math.floor(rnd(buildingColors.length))];
+        ctx.fillRect(x, h*0.58 - bh, bw, bh);
+        //windows
+        ctx.fillStyle = "rgba(255,230,150,0.5)";
+        for (let wy = h*0.58 - bh + 10; wy < h*0.58 - 10; wy += 18){
+            for (let wx = x +8 ; wx < x + bw - 8; wx += 18){
+                if (rnd(10) > 6) ctx.fillRect(wx, wy, 8, 10);
+            }
+        }
+        x += bw + 20 + rnd(40);
+    }
+
+    // walking path
+    ctx.fillStyle ="rgba(210,200,170,0.9)";
+  ctx.beginPath();
+  ctx.moveTo(0, h*0.86);
+  ctx.quadraticCurveTo(w*0.5, h*0.78, w, h*0.88);
+  ctx.lineTo(w, h);
+  ctx.lineTo(0, h);
+  ctx.closePath();
+  ctx.fill();
+
+  // location label baked subtly into the ground (helps orient during demo)
+  ctx.font = "bold 46px 'Space Grotesk', sans-serif";
+  ctx.fillStyle = "rgba(20,30,25,0.35)";
+  ctx.textAlign = "center";
+  ctx.fillText(node.name.toUpperCase(), w/2, h*0.94);
+
+  return c.toDataURL("image/jpeg", 0.85);
+}
+
+// ---- 3. THREE.JS PANORAMA VIEWER ------------------------------------------
+const viewerEl = document.getElementById("viewer");
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(90, window.innerWidth/window.innerHeight, 1, 1100);
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setClearColor(0x0a1d2a, 1);
+viewerEl.appendChild(renderer.domElement);
+
+const sphereGeo = new THREE.SphereGeometry(500, 60, 40);
+sphereGeo.scale(-1, 1, 1); // view form inside
+const sphereMat = new THREE.MeshBasicMaterial({ color: 0x1b2e36 });
+const sphereMesh = new THREE.Mesh(sphereGeo, sphereMat);
+scene.add(sphereMesh);
+ 
+const textureLoader = new THREE.TextureLoader();
+const textureCache = {};
+ 
+function loadPanoTexture(node){
+  if (textureCache[node.id]) return Promise.resolve(textureCache[node.id]);
+  const url = node.pano || generatePlaceholderPano(node);
+  return new Promise((resolve) => {
+    textureLoader.load(url, (tex) => {
+      tex.colorSpace = THREE.SRGBColorSpace || tex.colorSpace;
+      textureCache[node.id] = tex;
+      resolve(tex);
+    });
+  });
+}
+ 
+// camera look direction (spherical)
+let lon = 180, lat = 0;
+let targetLon = lon, targetLat = lat;
+let fov = 90;
+ 
+function animate(){
+  requestAnimationFrame(animate);
+  lon += (targetLon - lon) * 0.12;
+  lat += (targetLat - lat) * 0.12;
+  lat = Math.max(-85, Math.min(85, lat));
+  const phi = THREE.MathUtils.degToRad(90 - lat);
+  const theta = THREE.MathUtils.degToRad(lon);
+  const target = new THREE.Vector3(
+    500 * Math.sin(phi) * Math.cos(theta),
+    500 * Math.cos(phi),
+    500 * Math.sin(phi) * Math.sin(theta)
+  );
+  camera.position.set(0,0,0);
+  camera.lookAt(target);
+  camera.fov = fov;
+  camera.updateProjectionMatrix();
+  renderer.render(scene, camera);
+  updateHotspotPositions();
+}
+animate();
+ 
+// ---- 4. DRAG-TO-LOOK CONTROLS ----------------------------------------------
+let isDragging = false, startX=0, startY=0, startLon=0, startLat=0;
+viewerEl.addEventListener("pointerdown", (e) => {
+  isDragging = true;
+  viewerEl.classList.add("dragging");
+  startX = e.clientX; startY = e.clientY;
+  startLon = targetLon; startLat = targetLat;
+});
+window.addEventListener("pointerup", () => { isDragging = false; viewerEl.classList.remove("dragging"); });
+window.addEventListener("pointermove", (e) => {
+  if (!isDragging) return;
+  const dx = e.clientX - startX;
+  const dy = e.clientY - startY;
+  targetLon = startLon - dx * 0.18;
+  targetLat = startLat + dy * 0.18;
+});
+// touch handled via pointer events already (pointer* fires for touch too)
+ 
+viewerEl.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  fov = Math.max(40, Math.min(100, fov + e.deltaY * 0.03));
+}, { passive:false });
+ 
+document.getElementById("zoomIn").onclick = () => fov = Math.max(40, fov - 10);
+document.getElementById("zoomOut").onclick = () => fov = Math.min(100, fov + 10);
+ 
+window.addEventListener("resize", () => {
+  camera.aspect = window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+function bearingBetween(a, b){
+  // angle (degrees) from node a to node b using the 2D map coordinates
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  return (THREE.MathUtils.radToDeg(Math.atan2(dy, dx)) + 360) % 360;
+}
+ 
+function buildHotspots(node){
+  hotspotEls.forEach(h => h.el.remove());
+  hotspotEls = [];
+  node.links.forEach(linkId => {
+    const target = nodeById[linkId];
+    if (!target) return;
+    const bearing = bearingBetween(node, target);
+    const lonDeg = (450 - bearing) % 360;
+
+    const el = document.createElement("div");
+    el.className = "hotspot";
+    el.innerHTML = `
+      <div class="arrow">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M12 4 L20 12 L12 20 M4 12 H20" stroke="white" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="tag">${target.name}</div>`;
+    el.addEventListener("click", () => goToNode(linkId));
+    hotspotLayer.appendChild(el);
+    hotspotEls.push({ el, lonDeg });
+  });
+}
+ 
+function updateHotspotPositions(){
+  hotspotEls.forEach(({el, lonDeg}) => {
+    const phi = THREE.MathUtils.degToRad(90); // horizon
+    const theta = THREE.MathUtils.degToRad(lonDeg);
+    const p = new THREE.Vector3(
+      480 * Math.sin(phi) * Math.cos(theta),
+      -20,
+      480 * Math.sin(phi) * Math.sin(theta)
+    );
+    const proj = p.clone().project(camera);
+    const behindCamera = proj.z > 1;
+    if (behindCamera){ el.style.display = "none"; return; }
+    el.style.display = "flex";
+    el.style.left = ((proj.x + 1) / 2 * window.innerWidth) + "px";
+    el.style.top = ((1 - proj.y) / 2 * window.innerHeight) + "px";
+  });
+}
+ 
+// ---- 6. MINI MAP (SVG) -----------------------------------------------------
+const svg = document.getElementById("campusMap");
+ 
+function drawMap(){
+  svg.innerHTML = "";
+  // paths
+  const drawn = new Set();
+  nodes.forEach(n => {
+    n.links.forEach(linkId => {
+      const key = [n.id, linkId].sort().join("-");
+      if (drawn.has(key)) return;
+      drawn.add(key);
+      const t = nodeById[linkId];
+      const line = document.createElementNS("http://www.w3.org/2000/svg","line");
+      line.setAttribute("x1", n.x); line.setAttribute("y1", n.y);
+      line.setAttribute("x2", t.x); line.setAttribute("y2", t.y);
+      line.setAttribute("class","map-path");
+      svg.appendChild(line);
+    });
+  });
+  // nodes
+  nodes.forEach(n => {
+    const g = document.createElementNS("http://www.w3.org/2000/svg","g");
+    g.setAttribute("class", "map-node" + (n.id === currentId ? " active" : ""));
+    g.style.cursor = "pointer";
+    g.addEventListener("click", () => goToNode(n.id));
+ 
+    if (n.id === currentId){
+      const pulse = document.createElementNS("http://www.w3.org/2000/svg","circle");
+      pulse.setAttribute("cx", n.x); pulse.setAttribute("cy", n.y);
+      pulse.setAttribute("r", 9); pulse.setAttribute("class","map-you");
+      svg.appendChild(pulse);
+    }
+ 
+    const c = document.createElementNS("http://www.w3.org/2000/svg","circle");
+    c.setAttribute("cx", n.x); c.setAttribute("cy", n.y);
+    c.setAttribute("r", n.id === currentId ? 9 : 6);
+    g.appendChild(c);
+ 
+    const t = document.createElementNS("http://www.w3.org/2000/svg","text");
+    t.setAttribute("x", n.x); t.setAttribute("y", n.y - 12);
+    t.setAttribute("text-anchor","middle");
+    t.textContent = n.name;
+    g.appendChild(t);
+ 
+    svg.appendChild(g);
+  });
+}
+ 
+document.getElementById("mapHeader").addEventListener("click", () => {
+  document.getElementById("mapPanel").classList.toggle("expanded");
+});
+ 
+// ---- 7. NAVIGATION ----------------------------------------------------------
+const fadeEl = document.getElementById("fade");
+const labelEl = document.getElementById("locationLabel");
+ 
+async function goToNode(id, silent){
+  const node = nodeById[id];
+  if (!node) return;
+  fadeEl.classList.add("show");
+  await new Promise(r => setTimeout(r, 260));
+
+  const tex = await loadPanoTexture(node);
+  sphereMesh.material.map = tex;
+  sphereMesh.material.color.set(0xffffff);
+  sphereMesh.material.needsUpdate = true;
+
+  currentId = id;
+  labelEl.textContent = node.name;
+  buildHotspots(node);
+  drawMap();
+
+  fadeEl.classList.remove("show");
+  document.getElementById("hint").style.opacity = "0";
+}
+ 
+// ---- 8. INIT ----------------------------------------------------------------
+goToNode(currentId);
+setTimeout(() => { document.getElementById("hint").style.opacity = "0"; }, 4500);
