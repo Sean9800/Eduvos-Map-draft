@@ -1,1 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Eduvos Campus Walkthrough</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="eduvos-streetview.css">
+</head>
+<body>
+<div id="app">
+  <div id="fade"></div>
+  <div id="viewer"></div>
 
+  <div id="topbar">
+    <div class="brand"><span class="dot"></span> Eduvos Campus Walkthrough</div>
+    <div id="locationLabel">—</div>
+  </div>
+
+  <div id="hint">Drag to look around · Click an arrow to walk forward</div>
+
+  <div id="mapPanel">
+    <div id="mapHeader">
+      <span>Campus Map</span>
+      <span class="chev">▾</span>
+    </div>
+    <div id="mapSvgWrap">
+      <svg id="campusMap" viewBox="0 0 400 300"></svg>
+    </div>
+  </div>
+
+  <div id="zoomControls">
+    <div class="zoomBtn" id="zoomIn">+</div>
+    <div class="zoomBtn" id="zoomOut">–</div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="eduvos-streetview.js"></script>
+</body>
+</html>
